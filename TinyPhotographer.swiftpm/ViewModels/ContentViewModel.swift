@@ -39,22 +39,104 @@ class ContentViewModel: ObservableObject, ARCaptureDelegate {
         self.isDangerClose = false
     }
     
-    // MARK: - ARCaptureDelegate 代理方法实现
-    
-    /// 当 ARManager 获取到新的一帧图像和深度数据时，会自动触发这个方法
+// MARK: - ARCaptureDelegate 代理方法实现
     func didCaptureFrame(image: CIImage, depthMap: CVPixelBuffer?) {
         frameCount += 1
-        
-        // 性能优化：我们不需要处理摄像头的每一帧。跳帧处理可以极大节省电池和算力
         guard frameCount % processInterval == 0 else { return }
         
-        // 1. 让大脑 (CoreML) 去分析画面里有什么
-        mlManager.predict(image: image)
+        // 我们必须同时拥有深度图才能进行有意义的融合
+        guard let depthData = depthMap else { return }
         
-        // 2. 分析 LiDAR 传来的深度数据 (距离)
-        if let depthData = depthMap {
-            analyzeDepthAndObstacles(depthMap: depthData)
+        // 1. 让大脑去分析画面，并在闭包中接收分析出的 MLMultiArray 掩码
+        mlManager.predict(image: image) { [weak self] segmentationMask in
+            guard let self = self, let mask = segmentationMask else { return }
+            
+            // 2. 将深度图和语义掩码结合起来分析！
+            self.fuseDepthAndSemantics(depthMap: depthData, segmentationMask: mask)
         }
+    }
+    
+    // MARK: - 核心融合算法
+    private func fuseDepthAndSemantics(depthMap: CVPixelBuffer, segmentationMask: MLMultiArray) {
+        // 锁定内存以读取深度数据
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        
+        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return }
+        let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
+        
+        let depthWidth = CVPixelBufferGetWidth(depthMap)
+        let depthHeight = CVPixelBufferGetHeight(depthMap)
+        
+        // 假设 DeepLabV3 的输出形状是 [1, 513, 513] 或 [513, 513]
+        // 我们取最后一维的尺寸作为宽度和高度
+        let shapeCount = segmentationMask.shape.count
+        let segWidth = segmentationMask.shape[shapeCount - 1].intValue
+        let segHeight = segmentationMask.shape[shapeCount - 2].intValue
+        
+        // 算法步骤 1：在深度图的中心区域寻找最近的障碍物点
+        var minDistance: Float = 999.0 // 初始化为一个很大的距离
+        var closestPoint: (x: Int, y: Int) = (depthWidth / 2, depthHeight / 2)
+        
+        // 我们不遍历整个屏幕，只扫描中间 1/3 的区域，这是盲人行进最关注的区域
+        let startY = depthHeight / 3
+        let endY = (depthHeight / 3) * 2
+        let startX = depthWidth / 3
+        let endX = (depthWidth / 3) * 2
+        
+        for y in startY..<endY {
+            for x in startX..<endX {
+                let index = y * depthWidth + x
+                let distance = floatBuffer[index]
+                
+                // 忽略无效的深度值 (有些无效点会返回 0 或 NaN)
+                if distance > 0.1 && distance < minDistance {
+                    minDistance = distance
+                    closestPoint = (x, y)
+                }
+            }
+        }
+        
+        // 如果最近的距离还是大于 2 米，说明前方比较安全，无需报警
+        guard minDistance < 2.0 else {
+            DispatchQueue.main.async {
+                self.warningMessage = "前方路线畅通"
+                self.isDangerClose = false
+            }
+            return
+        }
+        
+        // 算法步骤 2：坐标映射！将深度图上的最近点坐标转换为分割掩码上的坐标
+        let mappedX = Int(Float(closestPoint.x) / Float(depthWidth) * Float(segWidth))
+        let mappedY = Int(Float(closestPoint.y) / Float(depthHeight) * Float(segHeight))
+        
+        // 算法步骤 3：读取该像素点的物体类别
+        // MLMultiArray 的读取需要将坐标转为 NSNumber 数组
+        let maskIndex = [NSNumber(value: mappedY), NSNumber(value: mappedX)]
+        let classIdNumber = segmentationMask[maskIndex] // 获取类别 ID (例如 15)
+        let classId = classIdNumber.intValue
+        
+        // 将数字 ID 翻译成人类听得懂的语言
+        let objectName = getObjectName(from: classId)
+        
+        // 算法步骤 4：更新 UI
+        DispatchQueue.main.async {
+            self.warningMessage = "⚠️ 警告：前方 \(String(format: "%.1f", minDistance)) 米处有【\(objectName)】"
+            self.isDangerClose = true
+        }
+    }
+    
+    // 辅助方法：将 DeepLabV3 的类别 ID 转换为字符串 (DeepLabV3 默认使用 PASCAL VOC 数据集)
+    private func getObjectName(from classId: Int) -> String {
+        // PASCAL VOC 共有 21 个类别 (0是背景)
+        let classes = [
+            0: "空旷区域", 1: "飞机", 2: "自行车", 3: "鸟", 4: "船",
+            5: "瓶子", 6: "公交车", 7: "汽车", 8: "猫", 9: "椅子",
+            10: "牛", 11: "餐桌", 12: "狗", 13: "马", 14: "摩托车",
+            15: "人", 16: "盆栽", 17: "羊", 18: "沙发", 19: "火车", 20: "显示器"
+        ]
+        
+        return classes[classId] ?? "未知障碍物"
     }
     
     // MARK: - 核心业务逻辑
